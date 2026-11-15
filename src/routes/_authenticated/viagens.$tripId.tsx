@@ -73,12 +73,17 @@ const STATUS: Record<string, { label: string; cls: string }> = {
 };
 const STATUS_STUCK = { label: "Parado", cls: "bg-warning/20 text-foreground" };
 
-// Documento "pendente" há mais de 1 minuto: a chamada à função falhou antes de
-// começar (ex.: rede, sessão). Para de recarregar e oferece "Tentar novamente".
-const STUCK_AFTER_MS = 60_000;
-type DocStatus = { status: string; created_at: string };
-const isStuck = (d: DocStatus) => d.status === "pending" && Date.now() - new Date(d.created_at).getTime() > STUCK_AFTER_MS;
-const isBusy = (d: DocStatus) => d.status === "processing" || (d.status === "pending" && !isStuck(d));
+// Documento parado: para de recarregar e oferece "Tentar novamente".
+// - "pendente" há mais de 1 min: a chamada à função falhou antes de começar.
+// - "processando" há mais de 3 min: a execução foi interrompida (ela dura no máx. ~150 s).
+const PENDING_STUCK_MS = 60_000;
+const PROCESSING_STUCK_MS = 3 * 60_000;
+type DocStatus = { status: string; created_at: string; processing_started_at?: string | null };
+const ageMs = (iso: string) => Date.now() - new Date(iso).getTime();
+const isStuck = (d: DocStatus) =>
+  (d.status === "pending" && ageMs(d.created_at) > PENDING_STUCK_MS) ||
+  (d.status === "processing" && ageMs(d.processing_started_at ?? d.created_at) > PROCESSING_STUCK_MS);
+const isBusy = (d: DocStatus) => (d.status === "pending" || d.status === "processing") && !isStuck(d);
 
 function DocsTab({ tripId }: { tripId: string }) {
   const qc = useQueryClient();
@@ -169,7 +174,11 @@ function DocsTab({ tripId }: { tripId: string }) {
                 {d.error_message && (
                   <p className={`mt-1 text-sm ${d.status === "error" ? "text-destructive" : "text-muted-foreground"}`}>{d.error_message}</p>
                 )}
-                {stuck && <p className="mt-1 text-sm text-muted-foreground">O processamento não começou. Tente novamente.</p>}
+                {stuck && (
+                  <p className="mt-1 text-sm text-muted-foreground">
+                    {d.status === "pending" ? "O processamento não começou." : "O processamento demorou demais."} Tente novamente.
+                  </p>
+                )}
               </div>
               <div className="flex shrink-0 items-center gap-2">
                 {canRetry && (
