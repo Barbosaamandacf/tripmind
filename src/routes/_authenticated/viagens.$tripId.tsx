@@ -1,6 +1,6 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { ArrowLeft, CalendarDays, CheckCircle2, Copy, FileText, Lightbulb, Loader2, MapPin, Pencil, Plus, RefreshCw, Sparkles, Trash2, Upload } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -13,7 +13,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle, AlertDialogTrigger } from "@/components/ui/alert-dialog";
 import { supabase } from "@/integrations/supabase/client";
-import { KINDS, errMsg, fmtDate, fmtDateTime } from "@/lib/trip";
+import { DETAIL_LABELS, KINDS, errMsg, fmtDate, fmtDateTime, invokeFn, readDetails } from "@/lib/trip";
 
 export const Route = createFileRoute("/_authenticated/viagens/$tripId")({
   head: () => ({
@@ -71,6 +71,14 @@ const STATUS: Record<string, { label: string; cls: string }> = {
   done: { label: "Concluído", cls: "bg-success/15 text-success" },
   error: { label: "Erro", cls: "bg-destructive/15 text-destructive" },
 };
+const STATUS_STUCK = { label: "Parado", cls: "bg-warning/20 text-foreground" };
+
+// Documento "pendente" há mais de 1 minuto: a chamada à função falhou antes de
+// começar (ex.: rede, sessão). Para de recarregar e oferece "Tentar novamente".
+const STUCK_AFTER_MS = 60_000;
+type DocStatus = { status: string; created_at: string };
+const isStuck = (d: DocStatus) => d.status === "pending" && Date.now() - new Date(d.created_at).getTime() > STUCK_AFTER_MS;
+const isBusy = (d: DocStatus) => d.status === "processing" || (d.status === "pending" && !isStuck(d));
 
 function DocsTab({ tripId }: { tripId: string }) {
   const qc = useQueryClient();
@@ -80,15 +88,30 @@ function DocsTab({ tripId }: { tripId: string }) {
   const docs = useQuery({
     queryKey: ["docs", tripId],
     queryFn: async () => { const { data, error } = await supabase.from("documents").select("*").eq("trip_id", tripId).order("created_at", { ascending: false }); if (error) throw error; return data; },
-    refetchInterval: (q) => {
-      const busy = q.state.data?.some((d) => d.status === "pending" || d.status === "processing");
-      return busy ? 3000 : false;
-    },
+    refetchInterval: (q) => (q.state.data?.some(isBusy) ? 3000 : false),
   });
+  const busy = !!docs.data?.some(isBusy);
   const prevBusy = useRef(false);
-  const busy = !!docs.data?.some((d) => d.status === "pending" || d.status === "processing");
-  if (prevBusy.current && !busy) qc.invalidateQueries({ queryKey: ["items", tripId] });
-  prevBusy.current = busy;
+  useEffect(() => {
+    // Quando o processamento termina, recarrega a aba de itens.
+    if (prevBusy.current && !busy) qc.invalidateQueries({ queryKey: ["items", tripId] });
+    prevBusy.current = busy;
+  }, [busy, qc, tripId]);
+
+  const [retrying, setRetrying] = useState<string | null>(null);
+  const retry = async (doc: { id: string; file_name: string }) => {
+    setRetrying(doc.id);
+    try {
+      await invokeFn("process-document", { document_id: doc.id });
+      toast.success(`${doc.file_name} processado!`);
+    } catch (e) {
+      toast.error(`Falha ao processar ${doc.file_name}: ${errMsg(e)}`);
+    } finally {
+      setRetrying(null);
+      qc.invalidateQueries({ queryKey: ["docs", tripId] });
+      qc.invalidateQueries({ queryKey: ["items", tripId] });
+    }
+  };
 
   const handle = useCallback(async (files: FileList | File[]) => {
     const { data: u } = await supabase.auth.getUser();
@@ -105,11 +128,12 @@ function DocsTab({ tripId }: { tripId: string }) {
         const { data: doc, error } = await supabase.from("documents").insert({ trip_id: tripId, storage_path: path, file_name: file.name, mime_type: file.type } as any).select().single();
         if (error) throw error;
         qc.invalidateQueries({ queryKey: ["docs", tripId] });
-        supabase.functions.invoke("process-document", { body: { document_id: doc.id } }).then(({ error }) => {
-          if (error) toast.error(`Falha ao processar ${file.name}: ${error.message}`);
-          qc.invalidateQueries({ queryKey: ["docs", tripId] });
-          qc.invalidateQueries({ queryKey: ["items", tripId] });
-        });
+        invokeFn("process-document", { document_id: doc.id })
+          .catch((e) => toast.error(`Falha ao processar ${file.name}: ${errMsg(e)}`))
+          .finally(() => {
+            qc.invalidateQueries({ queryKey: ["docs", tripId] });
+            qc.invalidateQueries({ queryKey: ["items", tripId] });
+          });
         toast.success(`${file.name} enviado! Processando…`);
       } catch (e) {
         toast.error(`Erro ao enviar ${file.name}: ${errMsg(e)}`);
@@ -134,15 +158,28 @@ function DocsTab({ tripId }: { tripId: string }) {
       {docs.error && <p className="text-destructive">Erro ao carregar documentos: {errMsg(docs.error)}</p>}
       <ul className="space-y-2">
         {docs.data?.map((d) => {
-          const s = STATUS[d.status] ?? STATUS["pending"]!;
+          const stuck = isStuck(d);
+          const s = stuck ? STATUS_STUCK : (STATUS[d.status] ?? STATUS["pending"]!);
+          const canRetry = d.status === "error" || stuck;
           return (
             <li key={d.id} className="flex items-start gap-3 rounded-xl border bg-card p-4">
               <FileText className="mt-0.5 h-5 w-5 shrink-0 text-primary" />
               <div className="min-w-0 flex-1">
                 <p className="truncate font-medium">{d.file_name}</p>
-                {d.status === "error" && d.error_message && <p className="mt-1 text-sm text-destructive">{d.error_message}</p>}
+                {d.error_message && (
+                  <p className={`mt-1 text-sm ${d.status === "error" ? "text-destructive" : "text-muted-foreground"}`}>{d.error_message}</p>
+                )}
+                {stuck && <p className="mt-1 text-sm text-muted-foreground">O processamento não começou. Tente novamente.</p>}
               </div>
-              <Badge variant="outline" className={`border-0 ${s.cls}`}>{d.status === "processing" && <Loader2 className="mr-1 h-3 w-3 animate-spin" />}{s.label}</Badge>
+              <div className="flex shrink-0 items-center gap-2">
+                {canRetry && (
+                  <Button size="sm" variant="outline" disabled={retrying === d.id} onClick={() => retry(d)}>
+                    {retrying === d.id ? <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="mr-1 h-3.5 w-3.5" />}
+                    Tentar novamente
+                  </Button>
+                )}
+                <Badge variant="outline" className={`border-0 ${s.cls}`}>{d.status === "processing" && <Loader2 className="mr-1 h-3 w-3 animate-spin" />}{s.label}</Badge>
+              </div>
             </li>
           );
         })}
@@ -151,7 +188,29 @@ function DocsTab({ tripId }: { tripId: string }) {
   );
 }
 
-type Item = { id: string; kind: string; title: string; starts_at: string | null; ends_at: string | null; location: string | null; confirmation_code: string | null };
+type Item = { id: string; kind: string; title: string; starts_at: string | null; ends_at: string | null; location: string | null; confirmation_code: string | null; details?: unknown };
+
+function ItemDetails({ details }: { details: unknown }) {
+  const d = readDetails(details);
+  const { origin, destination } = d;
+  const route = origin && destination ? `${origin} → ${destination}` : null;
+  const extras = Object.entries(DETAIL_LABELS).filter(([k]) => d[k]);
+  if (!route && !extras.length) return null;
+  return (
+    <div className="mt-2 space-y-1.5">
+      {route && <p className="text-sm font-medium text-foreground">{route}</p>}
+      {!!extras.length && (
+        <div className="flex flex-wrap gap-1.5">
+          {extras.map(([k, label]) => (
+            <span key={k} className="rounded-md bg-muted px-2 py-0.5 text-xs text-muted-foreground">
+              <span className="font-medium text-foreground">{label}:</span> {d[k]}
+            </span>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
 const empty = { kind: "other", title: "", starts_at: "", ends_at: "", location: "", confirmation_code: "" };
 
 function ItemsTab({ tripId, items, loading }: { tripId: string; items: Item[]; loading: boolean }) {
@@ -196,6 +255,7 @@ function ItemsTab({ tripId, items, loading }: { tripId: string; items: Item[]; l
                       <h3 className="font-semibold">{i.title}</h3>
                       <p className="mt-1 text-sm text-muted-foreground">{fmtDateTime(i.starts_at)}{i.ends_at ? ` → ${fmtDateTime(i.ends_at)}` : ""}</p>
                       {i.location && <p className="mt-0.5 flex items-center gap-1 text-sm text-muted-foreground"><MapPin className="h-3.5 w-3.5" />{i.location}</p>}
+                      <ItemDetails details={i.details} />
                       {i.confirmation_code && (
                         <button onClick={() => copy(i.confirmation_code!)} className="mt-2 inline-flex items-center gap-1.5 rounded-md bg-secondary px-2 py-1 font-mono text-sm text-secondary-foreground hover:bg-secondary/70">
                           {i.confirmation_code}<Copy className="h-3.5 w-3.5" />
@@ -254,7 +314,7 @@ function ItineraryTab({ tripId, hasItems }: { tripId: string; hasItems: boolean 
     queryFn: async () => { const { data, error } = await supabase.from("itineraries").select("*").eq("trip_id", tripId).order("created_at", { ascending: false }).limit(1).maybeSingle(); if (error) throw error; return data; },
   });
   const gen = useMutation({
-    mutationFn: async () => { const { error } = await supabase.functions.invoke("generate-itinerary", { body: { trip_id: tripId } }); if (error) throw error; },
+    mutationFn: () => invokeFn("generate-itinerary", { trip_id: tripId }),
     onSuccess: () => { toast.success("Roteiro pronto!"); qc.invalidateQueries({ queryKey: ["itinerary", tripId] }); },
     onError: (e) => toast.error("Não foi possível gerar o roteiro: " + errMsg(e)),
   });
