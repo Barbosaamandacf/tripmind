@@ -28,3 +28,4 @@ use the editor.
   own key and store it in Secrets.
 - **Secrets.** Lovable manages them. Do not put secret values in the repo.
 <!-- LOVABLE:END -->
+- Data access is browser-side via the Supabase client under RLS; AI work is done by externally managed edge functions (process-document, generate-itinerary) invoked with supabase.functions.invoke — the brief forbids creating them here.
